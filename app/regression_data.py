@@ -327,7 +327,7 @@ def save_to_excel(results_df, time_periods):
 # Main execution
 if __name__ == "__main__":
     tickers_file = "tickers.ts"
-    results_df, time_periods = analyze_tickers(tickers_file, limit=100)
+    results_df, time_periods = analyze_tickers(tickers_file, limit=1000)
     
     # Save results
     save_to_excel(results_df, time_periods)
