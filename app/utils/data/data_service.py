@@ -12,6 +12,7 @@ import os
 import logging
 import re
 from app.utils.visualization.visualization_service import is_stock
+from urllib.parse import quote_plus
 
 class DataService:
     def __init__(self):
@@ -22,13 +23,24 @@ class DataService:
         self.CAGR_METRICS = CAGR_METRICS
         
         # Database configuration
-        self.engine = create_engine(
-            f"mysql+pymysql://{os.getenv('MYSQL_USER')}:"
-            f"{os.getenv('MYSQL_PASSWORD')}@"
-            f"{os.getenv('MYSQL_HOST')}:"
-            f"{os.getenv('MYSQL_PORT', '3306')}/"
-            f"{os.getenv('MYSQL_DATABASE')}"
-        )
+        try:
+            # URL encode the password to handle special characters
+            password = quote_plus("Gern@8280")
+            base_url = f"mysql+pymysql://username:{password}@localhost"
+            
+            # First create a connection without database to create database if needed
+            engine = create_engine(base_url)
+            with engine.connect() as conn:
+                # conn.execute(text("DROP DATABASE IF EXISTS my_database"))
+                conn.execute(text("CREATE DATABASE  IF NOT EXISTS my_database"))
+                
+            
+            # Then create the main engine with the database
+            self.engine = create_engine(f"{base_url}/my_database")
+            print("Successfully connected to database")
+        except Exception as e:
+            print(f"Error initializing database connection: {e}")
+            raise
 
     def table_exists(self, table_name: str) -> bool:
         """Check if table exists in database"""
@@ -86,20 +98,6 @@ class DataService:
         """
         Get historical data from MySQL database or yfinance.
         Updates database with new data if requested end date is beyond max date.
-        
-        Parameters:
-        -----------
-        ticker : str
-            Stock ticker symbol
-        start_date : str
-            Start date in YYYY-MM-DD format
-        end_date : str
-            End date in YYYY-MM-DD format
-        
-        Returns:
-        --------
-        pd.DataFrame
-            DataFrame containing historical price data for the requested date range
         """
         cleaned_ticker = self.clean_ticker_for_table_name(ticker)
         table_name = f"his_{cleaned_ticker}"
@@ -117,135 +115,13 @@ class DataService:
             # Check if table exists in database
             if self.table_exists(table_name):
                 logging.info(f"Getting historical data for {ticker} from database")
-                
-                # Get table's date range
-                date_range_query = text(f"""
-                    SELECT MIN(Date) as min_date, MAX(Date) as max_date 
-                    FROM {table_name}
-                """)
-                date_range = pd.read_sql_query(date_range_query, self.engine)
-                
-                # Check for None in date_range values
-                min_date = date_range['min_date'][0]
-                max_date = date_range['max_date'][0]
-                
-                # If min_date or max_date is None, refresh all data
-                if min_date is None or max_date is None:
-                    logging.info(f"Database date range is invalid for {ticker}: min_date={min_date}, max_date={max_date}")
-                    logging.info("Refreshing data from external source...")
-                    success = self.store_historical_data(ticker)
-                    if not success:
-                        raise ValueError(f"Failed to store data for {ticker}")
-                    df = pd.read_sql_table(table_name, self.engine)
-                    df.set_index('Date', inplace=True)
-                    return df[(df.index >= start_date) & (df.index <= end_date)]
-                
-                # Convert dates for comparison
-                db_start = pd.to_datetime(min_date).strftime('%Y-%m-%d')
-                db_end = pd.to_datetime(max_date).strftime('%Y-%m-%d')
-                current_date = pd.Timestamp.now().strftime('%Y-%m-%d')
-                
-                # Calculate default 10-year period
-                default_start = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime('%Y-%m-%d')
-                
-                # If requested start date is before both database start and default period
-                if (start_date < db_start) and (start_date < default_start):
-                    logging.info(f"Requested start date {start_date} is before database range and default period")
-                    logging.info("Fetching data directly from yfinance...")
-                    
-                    # Fetch data directly for the requested period
-                    ticker_obj = yf.Ticker(ticker)
-                    df = ticker_obj.history(start=start_date, end=end_date)
-                    if df.empty:
-                        raise ValueError(f"No data found for {ticker} in requested date range")
-                    df.index = df.index.tz_localize(None)
-                    return df
-
-                # If requested start date is before database start but within default period
-                if start_date < db_start:
-                    logging.info(f"Requested start date {start_date} is before database start date {db_start}")
-                    logging.info("Fetching additional historical data from yfinance...")
-                    
-                    # Fetch additional historical data
-                    ticker_obj = yf.Ticker(ticker)
-                    new_data = ticker_obj.history(start=start_date, end=db_start)
-                    new_data.index = new_data.index.tz_localize(None)
-                    
-                    # Read existing data
-                    existing_data = pd.read_sql_table(table_name, self.engine)
-                    existing_data.set_index('Date', inplace=True)
-                    
-                    # Combine datasets
-                    combined_data = pd.concat([new_data, existing_data])
-                    combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
-                    combined_data.sort_index(inplace=True)
-                    
-                    # Update database
-                    success = self.store_dataframe(combined_data, table_name)
-                    if not success:
-                        raise ValueError(f"Failed to update data for {ticker}")
-                    
-                    return combined_data[(combined_data.index >= start_date) & (combined_data.index <= end_date)]
-                
-                # Check if data needs updating (more than 10 days old)
-                days_difference = (pd.to_datetime(current_date) - pd.to_datetime(db_end)).days
-                if days_difference > 10:
-                    logging.info(f"Data is {days_difference} days old. Updating from yfinance...")
-                    
-                    # Delete the last 10 days of data
-                    cutoff_date = pd.to_datetime(db_end) - pd.Timedelta(days=10)
-                    
-                    # Read existing data
-                    existing_data = pd.read_sql_table(table_name, self.engine)
-                    existing_data.set_index('Date', inplace=True)
-                    existing_data = existing_data[existing_data.index < cutoff_date]
-                    
-                    # Fetch new data
-                    ticker_obj = yf.Ticker(ticker)
-                    new_data = ticker_obj.history(start=cutoff_date.strftime('%Y-%m-%d'))
-                    new_data.index = new_data.index.tz_localize(None)
-                    
-                    # Combine datasets
-                    combined_data = pd.concat([existing_data, new_data])
-                    combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
-                    combined_data.sort_index(inplace=True)
-                    
-                    # Update database
-                    success = self.store_dataframe(combined_data, table_name)
-                    if not success:
-                        raise ValueError(f"Failed to update data for {ticker}")
-                    
-                    return combined_data[(combined_data.index >= start_date) & (combined_data.index <= end_date)]
-                
-                # If data is current enough, return filtered data from database
                 df = pd.read_sql_table(table_name, self.engine)
                 df.set_index('Date', inplace=True)
                 return df[(df.index >= start_date) & (df.index <= end_date)]
             
-            # If table doesn't exist, check if beyond default period
-            default_start = (pd.Timestamp.now() - pd.DateOffset(years=10)).strftime('%Y-%m-%d')
-            if start_date < default_start:
-                logging.info(f"Requested start date {start_date} is beyond default period and no existing data")
-                # Fetch data directly from yfinance for the specific period
-                ticker_obj = yf.Ticker(ticker)
-                df = ticker_obj.history(start=start_date, end=end_date)
-                if df.empty:
-                    raise ValueError(f"No data found for {ticker} in requested date range")
-                df.index = df.index.tz_localize(None)
-                return df
-            
-            # If within default period, store all historical data first
-            logging.info(f"Data not found in database for {ticker}, fetching data")
-            success = self.store_historical_data(ticker)
-            if not success:
-                raise ValueError(f"Failed to store data for {ticker}")
-            df = pd.read_sql_table(table_name, self.engine)
-            df.set_index('Date', inplace=True)
-            return df[(df.index >= start_date) & (df.index <= end_date)]
-                    
         except Exception as e:
-            logging.error(f"Error in get_historical_data for {ticker}: {str(e)}")
-            raise
+            print(f"Error getting historical data for {ticker}: {e}")
+            return None
         
         
     def get_financial_data(self, ticker: str, metric_description: str, 
